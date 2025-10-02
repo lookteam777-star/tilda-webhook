@@ -1,7 +1,7 @@
 // api/tilda-webhook.js
 module.exports = async (req, res) => {
   try {
-    // 1) Токен (должен совпасть с тем, что в URL)
+    // 1) Токен
     const token = (req.query && req.query.token ? String(req.query.token) : "");
     if (token !== "raskat_2025_secret") {
       return res.status(401).send("unauthorized");
@@ -12,7 +12,7 @@ module.exports = async (req, res) => {
       return res.status(405).send("method_not_allowed");
     }
 
-    // 3) Парсим тело (Tilda шлёт form-urlencoded)
+    // 3) Парсим тело (Tilda обычно шлёт x-www-form-urlencoded)
     const ct = (req.headers["content-type"] || "").toLowerCase();
     let data = {};
     if (ct.includes("application/json")) {
@@ -28,7 +28,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // 4) Формируем HTML с полями формы
+    // 4) HTML-письмо из полей формы
     const rows = Object.entries(data).map(([k, v]) => {
       const key = String(k);
       const val = String(v ?? "").replace(/\n/g, "<br>");
@@ -47,7 +47,7 @@ module.exports = async (req, res) => {
 
     const subject = `Новая заявка • ${new Date().toLocaleString("ru-RU")}`;
 
-    // 5) Отправляем письмо через SendGrid API (без зависимостей)
+    // 5) Отправка через SendGrid REST API
     const resp = await fetch("https://api.sendgrid.com/v3/mail/send", {
       method: "POST",
       headers: {
@@ -56,7 +56,7 @@ module.exports = async (req, res) => {
       },
       body: JSON.stringify({
         personalizations: [{ to: [{ email: "manager@raskat.rent" }], subject }],
-        from: { email: "manager@raskat.rent", name: "RASKAT RENTAL" },
+        from: { email: "manager@raskat.rent", name: "RASKAT RENTAL" }, // подтверждён в SendGrid
         content: [{ type: "text/html", value: html }]
       })
     });
