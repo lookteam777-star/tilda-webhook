@@ -1,0 +1,6 @@
+{
+  "name": "tilda-webhook",
+  "private": true,
+  "type": "module",
+  "dependencies": {}
+}
