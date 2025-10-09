@@ -3,7 +3,7 @@ const FROM_EMAIL = "manager@raskat.rent";           // подтверждённ�
 const MANAGER_EMAIL = "manager@raskat.rent";        // bcc для менеджера
 const SEND_BCC_TO_MANAGER = true;                   // выключить копию → false
 const TOKEN = "raskat_2025_secret";                 // должен совпасть с ?token=...
-const TEMPLATE_ID = "d_xxxxxxxxxxxxxxxxxxxxxxxxx";  // <-- вставь свой SendGrid Dynamic Template ID
+const TEMPLATE_ID = "d-2c8c04c022584a6b8eb9ad5712f7b22";  // <-- вставь свой SendGrid Dynamic Template ID
 
 module.exports = async (req, res) => {
   try {
