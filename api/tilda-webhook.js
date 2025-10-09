@@ -1,14 +1,14 @@
 // api/tilda-webhook.js
 module.exports = async (req, res) => {
   try {
-    // 0) токен
+    // 0) простая авторизация по токену из URL
     const token = (req.query && req.query.token ? String(req.query.token) : "");
     if (token !== "raskat_2025_secret") return res.status(401).send("unauthorized");
 
-    // 1) метод
+    // 1) принимаем только POST
     if (req.method !== "POST") return res.status(405).send("method_not_allowed");
 
-    // 2) парсинг тела (x-www-form-urlencoded / json)
+    // 2) надёжно парсим тело (x-www-form-urlencoded / json)
     const ct = (req.headers["content-type"] || "").toLowerCase();
     let data = {};
     try {
@@ -29,28 +29,34 @@ module.exports = async (req, res) => {
       data = {};
     }
 
-    // 3) HTML + текст
+    // 3) собираем HTML/Plain
     const rows = Object.entries(data).map(([k, v]) => {
       const key = String(k);
       const val = String(v ?? "").replace(/\n/g, "<br>");
-      return `<tr><td style="padding:6px 10px;border:1px solid #eee;"><b>${key}</b></td><td style="padding:6px 10px;border:1px solid #eee;">${val}</td></tr>`;
+      return `<tr>
+        <td style="padding:6px 10px;border:1px solid #eee;"><b>${key}</b></td>
+        <td style="padding:6px 10px;border:1px solid #eee;">${val}</td>
+      </tr>`;
     }).join("");
 
     const html = `
       <div style="font:14px/1.45 -apple-system,Segoe UI,Roboto,Arial">
-        <h2 style="margin:0 0 12px">Тестовое сообщение</h2>
+        <h2 style="margin:0 0 12px">Новая заявка с сайта</h2>
         <table cellspacing="0" cellpadding="0" style="border-collapse:collapse">${rows}</table>
         <p style="color:#888;margin-top:12px">Tilda → Vercel → SendGrid • ${new Date().toISOString()}</p>
       </div>`;
 
-    const text = Object.entries(data).map(([k, v]) => `${k}: ${String(v ?? "")}`).join("\n");
+    const text = Object.entries(data)
+      .map(([k, v]) => `${k}: ${String(v ?? "")}`)
+      .join("\n");
 
-    // 4) адреса
-    const TO = "lookteam777@gmail.com"; // тест-получатель
-    const FROM = "manager@raskat.rent"; // подтверждённый отправитель
-    const replyTo = (data.email || data.Email || "").toString().trim();
+    // 4) адреса и заголовки
+    const TO = "manager@raskat.rent";                 // единственный получатель
+    const FROM = "manager@raskat.rent";               // подтверждённый отправитель
+    const replyTo = (data.email || data.Email || data.mail || "").toString().trim();
+    const subject = `Заявка с сайта • ${new Date().toLocaleString("ru-RU")}`;
 
-    // 5) отправка через SendGrid REST API (+ детальная ошибка наружу)
+    // 5) отправка через SendGrid REST API
     const resp = await fetch("https://api.sendgrid.com/v3/mail/send", {
       method: "POST",
       headers: {
@@ -60,7 +66,10 @@ module.exports = async (req, res) => {
       body: JSON.stringify({
         personalizations: [{
           to: [{ email: TO }],
-          subject: `Тест заявки • ${new Date().toLocaleString("ru-RU")}`
+          subject
+          // при желании можно добавить cc/bcc:
+          // cc: [{ email: "another@raskat.rent" }],
+          // bcc: [{ email: "log@raskat.rent" }]
         }],
         from: { email: FROM, name: "RASKAT RENTAL" },
         ...(replyTo ? { reply_to: { email: replyTo } } : {}),
@@ -68,10 +77,12 @@ module.exports = async (req, res) => {
           { type: "text/plain", value: `Новая заявка\n\n${text}\n` },
           { type: "text/html",  value: html }
         ],
+        // меньше признаков рассылки
         tracking_settings: {
           click_tracking: { enable: false },
           open_tracking:  { enable: false }
         },
+        // чтобы письмо шло как транзакционное (не блокировать из-за отписок)
         mail_settings: {
           bypass_list_management: { enable: true }
         }
