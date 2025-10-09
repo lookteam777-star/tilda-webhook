@@ -1,80 +1,122 @@
-// api/tilda-webhook.js  — Vercel Serverless (CommonJS)
+// api/tilda-webhook.js — Vercel Serverless (CommonJS)
 
-// ——— настройки ———
-const TOKEN = "raskat_2025_secret";            // должен совпасть с ?token=...
-const FROM_EMAIL = "manager@raskat.rent";      // подтверждённый sender в SendGrid
-const MANAGER_EMAIL = "manager@raskat.rent";   // BCC менеджеру (можно убрать)
+// ===== Настройки =====
+const TOKEN = process.env.TILDA_TOKEN || "raskat_2025_secret"; // ?token=...
+const FROM_EMAIL = "manager@raskat.rent";                      // подтверждённый sender в SendGrid
+const MANAGER_EMAIL = "manager@raskat.rent";                   // BCC (можно "")
 
-// ——— ENV ———
+// ===== ENV =====
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY || "";
 const TEMPLATE_ID  = process.env.SENDGRID_TEMPLATE_ID || "";
+const IS_DYNAMIC_TPL = /^d-([0-9a-fA-F]{32}|[0-9a-fA-F-]{36})$/.test(TEMPLATE_ID);
 
-/** Dynamic Template ID: принимаем d-<uuid> И d-<32hex> */
-const isDynTpl = TEMPLATE_ID && /^d-([0-9a-fA-F]{32}|[0-9a-fA-F-]{36})$/.test(TEMPLATE_ID);
-
+// ===== Handler =====
 module.exports = async (req, res) => {
   try {
-    // 0) защита и метод
+    // Защита и метод
     if ((req.query?.token || "") !== TOKEN) return res.status(401).send("unauthorized");
     if (req.method !== "POST") return res.status(405).send("method_not_allowed");
 
-    // 1) парсинг тела (form-urlencoded / json)
+    // Парсинг тела
     const ct = (req.headers["content-type"] || "").toLowerCase();
     let body = {};
     if (ct.includes("application/x-www-form-urlencoded")) {
       const raw = await readRaw(req);
       body = Object.fromEntries(new URLSearchParams(raw));
-    } else {
+    } else if (ct.includes("application/json")) {
       body = req.body || {};
       if (typeof body === "string") {
         try { body = JSON.parse(body); } catch { body = { _raw: body }; }
       }
+    } else {
+      // на всякий — попытаемся прочесть
+      const raw = await readRaw(req);
+      try { body = JSON.parse(raw); } catch { body = Object.fromEntries(new URLSearchParams(raw)); }
     }
 
-    // 2) хелперы
-    const g = (...keys) => {
-      for (const k of keys) {
-        const v = body?.[k];
-        if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
+    // Диагностика: какие ключи реально пришли
+    const bodyKeys = Object.keys(body || {});
+    console.log("Tilda BODY keys:", bodyKeys);
+    res.setHeader("X-Body-Keys", bodyKeys.join(","));
+
+    // Режим быстрого просмотра (временно, для отладки):
+    if (String(req.query.debug) === "1") {
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      return res.status(200).send(JSON.stringify({ keys: bodyKeys, body }, null, 2));
+    }
+
+    // ============ Алиасы и геттеры ============
+    function normalizeKey(s) {
+      return String(s || "")
+        .toLowerCase()
+        .replace(/\s+/g, "")
+        .replace(/[_\-]+/g, "")
+        .replace(/[ё]/g, "е");
+    }
+    function pick(_body, aliases) {
+      const map = {};
+      Object.keys(_body || {}).forEach(k => {
+        map[normalizeKey(k)] = _body[k];
+      });
+      for (const a of aliases) {
+        const v = map[normalizeKey(a)];
+        if (v !== undefined && v !== null && String(v).trim() !== "") {
+          return String(v).trim();
+        }
       }
       return "";
+    }
+    const aliases = {
+      first_name: ["First Name","first_name","Имя","name","Name","contact_name","fio","ФИО","Фамилия и имя"],
+      last_name:  ["Last Name","last_name","Фамилия","surname","Surname","last"],
+      email:      ["Email","E-mail","email","Почта","mail","contact_email"],
+      date:       ["Date","date","Дата","Дата аренды","rental_date","date_rent","Дата начала аренды","Дата получения"],
+      days:       ["Days","days","Срок","Дней","Кол-во дней","rental_days","duration","srok"],
+      start_time: ["Start Time","start_time","Start","Начало","Время начала","Время получения","pickup time","Начало аренды"],
+      end_time:   ["End Time","end_time","End","Конец","Время окончания","Время возврата","return time","Конец аренды"],
+      delivery_method: ["Delivery","delivery_method","Доставка","Способ доставки","Delivery Method","Dostavka"],
+      products_text:   ["Products","products_text","Состав заказа","Товары","Order","Order Items","Basket","Корзина"],
+      total:      ["Price","Subtotal","Total","Итого","Сумма","Стоимость","order_total","amount"],
+      phone:      ["Phone","Телефон","phone","contact_phone"],
+      products_json: ["ProductsJSON","products_json","basket","items_json"]
     };
+    const g = (key) => pick(body, aliases[key]);
+
+    // ============ Формируем данные для шаблона ============
+    const tplData = {
+      first_name:      g("first_name"),
+      last_name:       g("last_name"),
+      email:           g("email"),
+      date:            g("date"),
+      days:            g("days"),
+      start_time:      g("start_time"),
+      end_time:        g("end_time"),
+      delivery_method: g("delivery_method"),
+      products_text:   g("products_text"),
+      total:           g("total"),
+      phone:           g("phone"),
+      submitted_at:    new Date().toLocaleString("ru-RU")
+    };
+
+    // Email обязателен
+    const clientEmail = tplData.email;
+    if (!clientEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(clientEmail)) {
+      return res.status(400).send("no_email");
+    }
+
+    // ============ Собираем items ============
+    let items;
     const toNum = (v) => {
       const s = String(v ?? "").replace(/\s/g,"").replace(/,/g,".").replace(/[^\d.]/g,"");
       const n = parseFloat(s);
       return Number.isFinite(n) ? n : undefined;
     };
 
-    // 3) собираем данные для шаблона (как просил)
-    const tplData = {
-      first_name:      g("First Name","first_name","Имя"),
-      last_name:       g("Last Name","last_name","Фамилия"),
-      email:           g("Email","email","E-mail","Почта"),
-      date:            g("Date","date","Дата"),
-      days:            g("Days","days","Кол-во дней","Дней"),
-      start_time:      g("Start Time","start_time","Начало","Start"),
-      end_time:        g("End Time","end_time","Конец","Finish","End"),
-      delivery_method: g("Delivery","Dostavka","delivery_method","Delivery Method","Способ доставки","Доставка"),
-      products_text:   g("Products","products_text","Состав заказа","Товары"),
-      total:           g("Price","Subtotal","total","Итого","Сумма"),
-      phone:           g("Phone","Телефон","phone"),
-      submitted_at:    new Date().toLocaleString("ru-RU")
-    };
-
-    // email клиента обязателен
-    const clientEmail = tplData.email;
-    if (!clientEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(clientEmail)) {
-      return res.status(400).send("no_email");
-    }
-
-    // 4) items (по возможности)
-    let items;
-
-    // 4.1) JSON корзина (предпочтительно)
-    const jsonRaw = g("ProductsJSON","products_json","basket","items_json");
-    if (jsonRaw) {
+    // 1) JSON
+    const productsJsonRaw = g("products_json");
+    if (productsJsonRaw) {
       try {
-        const arr = JSON.parse(jsonRaw);
+        const arr = JSON.parse(productsJsonRaw);
         if (Array.isArray(arr) && arr.length) {
           items = arr.map((it, i) => ({
             n: i + 1,
@@ -84,10 +126,9 @@ module.exports = async (req, res) => {
             sum: it.sum ?? it.total ?? ""
           }));
         }
-      } catch { /* игнор */ }
+      } catch {}
     }
-
-    // 4.2) Разбор строкового Products построчно
+    // 2) Плоский текст
     if (!items && tplData.products_text) {
       const lines = tplData.products_text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
       if (lines.length) {
@@ -106,10 +147,9 @@ module.exports = async (req, res) => {
         });
       }
     }
-
     if (items && items.length) tplData.items = items;
 
-    // 5) Fallback контент (если шаблон не пройдёт валидацию)
+    // ============ Fallback-письмо ============
     const rowsHtml = Object.entries({
       "First Name": tplData.first_name,
       "Last Name":  tplData.last_name,
@@ -158,12 +198,11 @@ module.exports = async (req, res) => {
 
     const subject = `Ваша заявка — RASKAT RENTAL • ${tplData.submitted_at}`;
 
-    // 6) personalizations
+    // ============ Payload для SendGrid ============
     const personalization = { to: [{ email: clientEmail }], subject };
     if (MANAGER_EMAIL) personalization.bcc = [{ email: MANAGER_EMAIL }];
 
-    // 7) собираем payload
-    const payload = isDynTpl
+    const payload = IS_DYNAMIC_TPL
       ? {
           personalizations: [{
             ...personalization,
@@ -187,12 +226,12 @@ module.exports = async (req, res) => {
           mail_settings: { bypass_list_management: { enable: true } }
         };
 
-    // 8) диагностические заголовки (удалишь после наладки)
+    // Диагностические заголовки
     res.setHeader("X-Build", process.env.VERCEL_GIT_COMMIT_SHA || "no-sha");
     res.setHeader("X-Template", TEMPLATE_ID || "no-template");
-    res.setHeader("X-UseTemplate", String(isDynTpl));
+    res.setHeader("X-UseTemplate", String(IS_DYNAMIC_TPL));
 
-    // 9) отправка в SendGrid
+    // Отправка в SendGrid
     const sgResp = await fetch("https://api.sendgrid.com/v3/mail/send", {
       method: "POST",
       headers: {
@@ -201,7 +240,6 @@ module.exports = async (req, res) => {
       },
       body: JSON.stringify(payload)
     });
-
     const sgText = await sgResp.text();
     console.log("SendGrid:", sgResp.status, sgText);
     if (!sgResp.ok) return res.status(500).send(`sendgrid_error ${sgResp.status}: ${sgText}`);
@@ -213,7 +251,7 @@ module.exports = async (req, res) => {
   }
 };
 
-// ——— utils ———
+// ===== Utils =====
 function readRaw(req) {
   return new Promise((resolve) => {
     let b = "";
