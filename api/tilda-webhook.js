@@ -1,62 +1,63 @@
 // api/tilda-webhook.js
+const FROM_EMAIL = "manager@raskat.rent";           // подтверждённый отправитель
+const MANAGER_EMAIL = "manager@raskat.rent";        // bcc для менеджера
+const SEND_BCC_TO_MANAGER = true;                   // выключить копию → false
+const TOKEN = "raskat_2025_secret";                 // должен совпасть с ?token=...
+const TEMPLATE_ID = "d_xxxxxxxxxxxxxxxxxxxxxxxxx";  // <-- вставь свой SendGrid Dynamic Template ID
+
 module.exports = async (req, res) => {
   try {
-    // 0) простая авторизация по токену из URL
-    const token = (req.query && req.query.token ? String(req.query.token) : "");
-    if (token !== "raskat_2025_secret") return res.status(401).send("unauthorized");
-
-    // 1) принимаем только POST
+    const token = (req.query?.token || "").toString();
+    if (token !== TOKEN) return res.status(401).send("unauthorized");
     if (req.method !== "POST") return res.status(405).send("method_not_allowed");
 
-    // 2) надёжно парсим тело (x-www-form-urlencoded / json)
+    // Парсинг тела (x-www-form-urlencoded / json)
     const ct = (req.headers["content-type"] || "").toLowerCase();
     let data = {};
-    try {
-      if (ct.includes("application/json")) {
-        data = req.body || {};
+    if (ct.includes("application/json")) {
+      data = req.body || {};
+    } else {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const raw = Buffer.concat(chunks).toString("utf8");
+      if (ct.includes("application/x-www-form-urlencoded")) {
+        data = Object.fromEntries(new URLSearchParams(raw));
       } else {
-        const chunks = [];
-        for await (const c of req) chunks.push(c);
-        const raw = Buffer.concat(chunks).toString("utf8");
-        if (ct.includes("application/x-www-form-urlencoded")) {
-          data = Object.fromEntries(new URLSearchParams(raw));
-        } else {
-          try { data = JSON.parse(raw); } catch { data = { _raw: raw }; }
-        }
+        try { data = JSON.parse(raw); } catch { data = { _raw: raw }; }
       }
-    } catch (e) {
-      console.error("Body parse error:", e);
-      data = {};
     }
 
-    // 3) собираем HTML/Plain
-    const rows = Object.entries(data).map(([k, v]) => {
-      const key = String(k);
-      const val = String(v ?? "").replace(/\n/g, "<br>");
-      return `<tr>
-        <td style="padding:6px 10px;border:1px solid #eee;"><b>${key}</b></td>
-        <td style="padding:6px 10px;border:1px solid #eee;">${val}</td>
-      </tr>`;
-    }).join("");
+    // Достаём email клиента
+    const pick = (o, keys) => { for (const k of keys) { const v = o?.[k]; if (v && String(v).trim()) return String(v).trim(); } return ""; };
+    const clientEmail = pick(data, ["email","Email","e-mail","mail","client_email","contact[email]"]);
+    const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
+    if (!clientEmail || !emailRe.test(clientEmail)) return res.status(400).send("no_email");
 
-    const html = `
-      <div style="font:14px/1.45 -apple-system,Segoe UI,Roboto,Arial">
-        <h2 style="margin:0 0 12px">Новая заявка с сайта</h2>
-        <table cellspacing="0" cellpadding="0" style="border-collapse:collapse">${rows}</table>
-        <p style="color:#888;margin-top:12px">Tilda → Vercel → SendGrid • ${new Date().toISOString()}</p>
-      </div>`;
+    // Подготовим объект для {{fields}} и “красивые” ключи
+    const normalizeKey = (k) => String(k).replace(/[_-]+/g," ").replace(/\b\w/g, s => s.toUpperCase());
+    const fields = {};
+    for (const [k,v] of Object.entries(data)) fields[normalizeKey(k)] = String(v ?? "");
 
-    const text = Object.entries(data)
-      .map(([k, v]) => `${k}: ${String(v ?? "")}`)
-      .join("\n");
+    // Данные для шаблона (доступны как {{name}}, {{message}}, {{fields}}, {{submitted_at}} и т.д.)
+    const dyn = {
+      name: pick(data, ["name","Name","Имя"]) || "",
+      message: pick(data, ["message","сообщение","comment","Комментарий"]) || "",
+      phone: pick(data, ["phone","Телефон"]) || "",
+      email: clientEmail,
+      submitted_at: new Date().toLocaleString("ru-RU"),
+      fields // {{#each fields}} для таблицы всех полей
+    };
 
-    // 4) адреса и заголовки
-    const TO = "manager@raskat.rent";                 // единственный получатель
-    const FROM = "manager@raskat.rent";               // подтверждённый отправитель
-    const replyTo = (data.email || data.Email || data.mail || "").toString().trim();
-    const subject = `Заявка с сайта • ${new Date().toLocaleString("ru-RU")}`;
+    // Personalization
+    const personalization = {
+      to: [{ email: clientEmail }],
+      dynamic_template_data: dyn
+    };
+    if (SEND_BCC_TO_MANAGER && MANAGER_EMAIL) {
+      personalization.bcc = [{ email: MANAGER_EMAIL }];
+    }
 
-    // 5) отправка через SendGrid REST API
+    // Отправка по шаблону
     const resp = await fetch("https://api.sendgrid.com/v3/mail/send", {
       method: "POST",
       headers: {
@@ -64,39 +65,28 @@ module.exports = async (req, res) => {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        personalizations: [{
-          to: [{ email: TO }],
-          subject
-          // при желании можно добавить cc/bcc:
-          // cc: [{ email: "another@raskat.rent" }],
-          // bcc: [{ email: "log@raskat.rent" }]
-        }],
-        from: { email: FROM, name: "RASKAT RENTAL" },
-        ...(replyTo ? { reply_to: { email: replyTo } } : {}),
-        content: [
-          { type: "text/plain", value: `Новая заявка\n\n${text}\n` },
-          { type: "text/html",  value: html }
-        ],
-        // меньше признаков рассылки
+        personalizations: [personalization],
+        from: { email: FROM_EMAIL, name: "RASKAT RENTAL" },
+        reply_to: { email: FROM_EMAIL },
+        template_id: TEMPLATE_ID,
+        // Можно отключить трекинг для «натуральности»
         tracking_settings: {
           click_tracking: { enable: false },
           open_tracking:  { enable: false }
         },
-        // чтобы письмо шло как транзакционное (не блокировать из-за отписок)
         mail_settings: {
-          bypass_list_management: { enable: true }
+          bypass_list_management: { enable: true } // транзакционное письмо
         }
       })
     });
 
-    const sgText = await resp.text();
-    console.log("SendGrid resp:", resp.status, sgText);
-
-    if (!resp.ok) return res.status(500).send(`sendgrid_error ${resp.status}: ${sgText}`);
+    const text = await resp.text();
+    console.log("SendGrid resp:", resp.status, text);
+    if (!resp.ok) return res.status(500).send(`sendgrid_error ${resp.status}: ${text}`);
 
     return res.status(200).send("ok");
-  } catch (err) {
-    console.error("Webhook fatal error:", err);
+  } catch (e) {
+    console.error("Webhook fatal error:", e);
     return res.status(500).send("internal_error");
   }
 };
