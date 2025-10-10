@@ -47,7 +47,7 @@ module.exports = async (req, res) => {
           equipment_list: equipmentList,
         },
       }],
-      template_id: process.env.SENDGRID_TEMPLATE_ID_RU || 'd-cb881e00e3f04d1faa169fe4656fc844',
+      template_id: process.env.SENDGRID_TEMPLATE_ID_REG_RU || 'd-cb881e00e3f04d1faa169fe4656fc844',
     };
 
     const sgRes = await fetch(SG_URL, {
