@@ -11,9 +11,7 @@ const {
   SENDGRID_API_KEY,
   FROM_EMAIL = 'manager@raskat.rent',
   FROM_NAME  = 'RASKAT RENTAL',
-  MANAGER_EMAIL,                         // опц.: копия менеджеру
-  SG_TEMPLATE_ID,                        // динам. шаблон для клиента
-  SG_TEMPLATE_MANAGER_ID,                // опц.: отдельный шаблон менеджеру
+  SG_TEMPLATE_ID = 'd-2c8c04c022584a6b8eb9ad5712f7b226',                        // динам. шаблон для клиента
   WEBHOOK_TOKEN = 'raskat_2025_secret',  // токен в URL ?token=
 } = process.env;
 
