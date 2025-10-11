@@ -115,7 +115,7 @@ module.exports = async (req, res) => {
     // env
     const API_KEY    = process.env.SENDGRID_API_KEY;
     const FROM_EMAIL = process.env.SEND_FROM_EMAIL_RU || 'manager@raskat.rent';
-    const TEMPLATE_ID = process.env.SENDGRID_TEMPLATE_ID_RU || 'd-cb881e00e3f04d1faa169fe4656fc84';
+    const TEMPLATE_ID = process.env.SENDGRID_TEMPLATE_ID_REG_RU || 'd-cb881e00e3f04d1faa169fe4656fc84';
     if (!API_KEY) return res.status(500).send('Missing SENDGRID_API_KEY env');
 
     // отправляем только name/email
