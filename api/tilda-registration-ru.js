@@ -11,7 +11,7 @@ try {
 // ==== ENV ====
 const {
   // токен авторизации (как в старых рабочих вебхуках): ?token=...
-  WEBHOOK_TOKEN = 'raskat_2025_secret',
+  WEBHOOK_TOKEN = 'u6eZrVh0rN1m2uU7yN3qQ0vT8pJ4aW9k',
 
   // SendGrid
   SENDGRID_API_KEY,
