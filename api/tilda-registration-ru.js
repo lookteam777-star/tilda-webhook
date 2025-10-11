@@ -1,23 +1,19 @@
 // api/tilda-registration-ru.js
-// Мини-вебхук регистрации: Tilda → SendGrid (только name + email), авторизация по ?token= или X-Webhook-Token
+// Мини-вебхук регистрации: Tilda → SendGrid (только name + email)
+// Авторизация: token из BODY (POST) + Query (?token=) + Header (X-Webhook-Token)
 
 let sgMail = null;
 try {
-  sgMail = require('@sendgrid/mail'); // если пакета нет — не упадём, но письма не уйдут
+  sgMail = require('@sendgrid/mail');
 } catch (e) {
   console.warn('SendGrid SDK not installed; email sending will be skipped.');
 }
 
 // ==== ENV ====
 const {
-  // токен авторизации (как в старых рабочих вебхуках): ?token=...
   WEBHOOK_TOKEN = 'u6eZrVh0rN1m2uU7yN3qQ0vT8pJ4aW9k',
-
-  // SendGrid
   SENDGRID_API_KEY,
   SEND_FROM_EMAIL_RU = 'manager@raskat.rent',
-
-  // ID динамического шаблона (можно задать любой из них; если оба пустые — возьмём дефолт ниже)
   SENDGRID_TEMPLATE_ID_RU = 'd-cb881e00e3f04d1faa169fe4656fc844',
   SENDGRID_TEMPLATE_ID_REG_RU = 'd-cb881e00e3f04d1faa169fe4656fc844',
 } = process.env;
@@ -28,8 +24,6 @@ if (sgMail && SENDGRID_API_KEY) {
 
 // ==== helpers ====
 const first = (v) => (Array.isArray(v) ? v[0] : v);
-
-// вытянуть значение по любому из вариантов ключей (без регистра)
 const getAny = (obj, variants = []) => {
   const map = new Map(Object.keys(obj || {}).map(k => [k.toLowerCase(), obj[k]]));
   for (const v of variants) {
@@ -39,20 +33,18 @@ const getAny = (obj, variants = []) => {
   return '';
 };
 
-// принять JSON-строку или x-www-form-urlencoded → объект
+// JSON-строка или x-www-form-urlencoded → объект
 function asObject(body) {
   if (!body) return {};
   if (typeof body === 'object') return body;
   const s = String(body);
 
-  // 1) JSON?
-  try {
+  try { // JSON
     const j = JSON.parse(s);
     return Array.isArray(j) ? j[0] || {} : j;
   } catch {}
 
-  // 2) urlencoded: a=1&b=2
-  try {
+  try { // urlencoded
     const params = new URLSearchParams(s);
     const obj = {};
     for (const [k, v] of params) obj[k] = v;
@@ -79,38 +71,37 @@ module.exports = async (req, res) => {
   try {
     if (req.method !== 'POST') return fail(res, 'method_not_allowed', 405);
 
-    // Авторизация: поддерживаем ?token=... и заголовок X-Webhook-Token
-    const tokenFromQuery = (req.query && req.query.token) || '';
-    const tokenFromHeader = req.headers['x-webhook-token'] || '';
-    const providedToken = String(tokenFromQuery || tokenFromHeader).trim();
-    if (providedToken !== String(WEBHOOK_TOKEN)) return fail(res, 'unauthorized', 401);
-
-    // Парсим тело
+    // Парсим body СРАЗУ — токен может лежать в POST
     const received = asObject(req.body);
 
-    // Поля формы: берём только name и email (поддерживаем разные системные имена)
+    // Авторизация: body / query / header (любое из имён ниже подойдёт)
+    const tokenFromBody =
+      getAny(received, ['x-webhook-token', 'X-Webhook-Token', 'webhook_token', 'token', 'api_key']);
+
+    const tokenFromQuery  = (req.query && req.query.token) || '';
+    const tokenFromHeader = req.headers['x-webhook-token'] || '';
+
+    const providedToken = String(tokenFromBody || tokenFromQuery || tokenFromHeader).trim();
+    if (providedToken !== String(WEBHOOK_TOKEN)) return fail(res, 'unauthorized', 401);
+
+    // Поля формы: берём только name и email (с разными системными именами)
     const name  = getAny(received, ['name','Name','fullname','fio','first_name','firstname']);
     const email = getAny(received, ['email','Email','e-mail','mail','client_email','email-1','email1']);
 
-    // Honeypot — если скрытое поле заполнено, просто говорим OK
+    // Honeypot
     const website = getAny(received, ['website','Website']);
     if (website) return ok(res);
 
-    // Важно: Tilda при “Проверить Webhook” часто шлёт пустой POST без полей → вернём OK,
-    // чтобы URL прикрепился. Реальная отправка уже будет с email, и письмо уйдёт.
+    // Пустые проверки Тильды → просто OK, чтобы attach проходил
     if (!email) return ok(res);
 
-    // Если SendGrid не сконфигурирован — не падаем; для attach это достаточно
     if (!sgMail || !SENDGRID_API_KEY) {
       console.warn('SendGrid not configured — skip sending');
       return ok(res);
     }
 
-    // Определяем шаблон: ENV -> дефолт (ваш новый ID)
-    const templateId =
-      SENDGRID_TEMPLATE_ID_RU ||
-      SENDGRID_TEMPLATE_ID_REG_RU ||
-      'd-cb881e00e3f04d1faa169fe4656fc844'; // новый ID, который вы дали
+    const templateId = SENDGRID_TEMPLATE_ID_RU || SENDGRID_TEMPLATE_ID_REG_RU ||
+      'd-cb881e00e3f04d1faa169fe4656fc844';
 
     const msg = {
       to: email,
@@ -127,9 +118,8 @@ module.exports = async (req, res) => {
       const r = await sgMail.send(msg);
       console.log('SendGrid status:', r[0]?.statusCode);
     } catch (e) {
-      // Вернём текст ошибки наружу (удобно видеть в Tilda сразу причину)
-      const msg = e?.response?.body ? JSON.stringify(e.response.body) : (e.message || 'sendgrid_error');
-      return fail(res, msg, 502);
+      const details = e?.response?.body ? JSON.stringify(e.response.body) : (e.message || 'sendgrid_error');
+      return fail(res, details, 502);
     }
 
     return ok(res);
@@ -138,5 +128,5 @@ module.exports = async (req, res) => {
   }
 };
 
-// Явно укажем Node runtime
+// Явный runtime
 module.exports.config = { runtime: 'nodejs18.x' };
