@@ -1,13 +1,13 @@
-// Вебхук Tilda → SendGrid (RU). Извлекаем ТОЛЬКО name и email максимально надёжно.
+// api/tilda-registration-ru.js
+// Вебхук Tilda → SendGrid (RU). Извлекаем ТОЛЬКО name и email, остальное игнорируем.
 
 const SG_URL = 'https://api.sendgrid.com/v3/mail/send';
 
-// --- утилиты поиска значения по «похожим» ключам ---
+// --- утилиты извлечения полей (работают с любыми форматами Tilda) ---
 const EMAIL_RX = /(^|\b)email(\d+)?($|\b)/i;
 const NAME_RX  = /(^|\b)(name|fullname|fio)($|\b)/i;
 const HONEYPOT_RX = /(^|\b)website($|\b)/i;
 
-// ищем в массиве вида [{name,value}] или [{key,val}] с "похожими" именами
 function findInKVArray(arr, rx) {
   if (!Array.isArray(arr)) return '';
   for (const it of arr) {
@@ -20,7 +20,6 @@ function findInKVArray(arr, rx) {
   return '';
 }
 
-// ищем по объекту: перебираем ВСЕ ключи и берём первый, чьё имя подходит по regex
 function findInObject(obj, rx) {
   if (!obj || typeof obj !== 'object') return '';
   for (const [k, v] of Object.entries(obj)) {
@@ -29,25 +28,22 @@ function findInObject(obj, rx) {
   return '';
 }
 
-// глубокий поиск: обходим произвольную структуру (объекты/массивы) и пытаемся вытащить по regex
 function deepFind(node, rx) {
   if (!node) return '';
-  // прямое совпадение в объекте
   const direct = findInObject(node, rx);
   if (direct) return direct;
 
-  // массив пар?
   const kv = findInKVArray(node, rx);
   if (kv) return kv;
 
-  // известные контейнеры tilda
+  // стандартные контейнеры Tilda
   const containers = [node?.data, node?.formdata, node?.fields, node?.form];
   for (const c of containers) {
-    const fromContainer = deepFind(c, rx);
-    if (fromContainer) return fromContainer;
+    const got = deepFind(c, rx);
+    if (got) return got;
   }
 
-  // обычные вложенные структуры
+  // произвольные вложения
   if (Array.isArray(node)) {
     for (const item of node) {
       const got = deepFind(item, rx);
@@ -62,17 +58,15 @@ function deepFind(node, rx) {
   return '';
 }
 
-// нормализуем body из Tilda (string | array | object)
 function normalizeBody(req) {
   let raw = req.body;
   if (typeof raw === 'string') {
     try { raw = JSON.parse(raw); } catch { raw = {}; }
   }
-  // Tilda часто шлёт массив с одним объектом
-  const base = Array.isArray(raw) ? raw[0] : (raw || {});
-  return base;
+  return Array.isArray(raw) ? raw[0] : (raw || {});
 }
 
+// --- обработчик ---
 module.exports = async (req, res) => {
   try {
     if (req.method !== 'POST') {
@@ -80,7 +74,7 @@ module.exports = async (req, res) => {
       return res.status(405).send('Method Not Allowed');
     }
 
-    // auth по секрету
+    // auth
     const q = req.query || {};
     const provided =
       (q.secret || q.token || '').toString().trim() ||
@@ -90,48 +84,69 @@ module.exports = async (req, res) => {
     if (!provided) return res.status(401).send('Unauthorized: no secret');
     if (provided !== expected) return res.status(401).send('Unauthorized: bad secret');
 
-    const debug = (q.debug || '') === '1';
-    const isCheck = (q.check || '') === '1';
-    const echo = (q.echo || '') === '1';
+    const debug = (q.debug || '') === '1'; // показать текст ошибки SendGrid
+    const echo  = (q.echo  || '') === '1'; // вернуть распарсенные поля (без отправки)
+    const allowEmptyCheck = process.env.ALLOW_EMPTY_TILDA_CHECK === '1';
+    const ua = (req.headers['user-agent'] || '').toLowerCase();
 
+    // parse
     const base = normalizeBody(req);
 
-    // honeypot (если вдруг Tilda/браузер что-то подставил — письмо не шлём)
-    const honeypot =
-      deepFind(base, HONEYPOT_RX);
+    // honeypot
+    const honeypot = deepFind(base, HONEYPOT_RX);
     if (honeypot) return res.status(200).send('OK');
 
-    // достаём email / name из любых мест
     const email = deepFind(base, EMAIL_RX);
     const name  = deepFind(base, NAME_RX);
 
-    if (echo) {
-      return res.status(200).json({ parsed: { name, email }, raw: base });
-    }
+    if (echo) return res.status(200).json({ parsed: { name, email }, raw: base });
 
-    if (!email && isCheck) return res.status(200).send('OK');
+    // пустая проверка из админки Tilda без email — отвечаем OK, если включено ENV
+    if (!email && allowEmptyCheck && ua.includes('tilda')) {
+      return res.status(200).send('OK');
+    }
     if (!email) return res.status(400).send('Missing email');
 
     // env
-    const API_KEY    = process.env.SENDGRID_API_KEY;
-    const FROM_EMAIL = process.env.SEND_FROM_EMAIL_RU || 'manager@raskat.rent';
-    const TEMPLATE_ID = process.env.SENDGRID_TEMPLATE_ID_REG_RU || 'd-cb881e00e3f04d1faa169fe4656fc844';
+    const API_KEY     = process.env.SENDGRID_API_KEY;
+    const FROM_EMAIL  = process.env.SEND_FROM_EMAIL_RU || 'manager@raskat.rent';
+
+    // Поддерживаем оба имени переменной; если не заданы — используем НОВЫЙ ID по умолчанию:
+    const TEMPLATE_ID =
+      process.env.SENDGRID_TEMPLATE_ID_REG_RU ||
+      'd-cb881e00e3f04d1faa169fe4656fc844';
+
     if (!API_KEY) return res.status(500).send('Missing SENDGRID_API_KEY env');
 
-    // отправляем только name/email
-    const sgPayload = {
-      from: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
-      reply_to: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
-      personalizations: [{
-        to: [{ email }],
-        // bcc: [{ email: FROM_EMAIL }], // включи при необходимости
-        dynamic_template_data: {
-          name: name || 'клиент',
-          year: new Date().getFullYear(),
-        },
-      }],
-      template_id: TEMPLATE_ID,
-    };
+    // если TEMPLATE_ID задан — шлём по шаблону; иначе fallback с subject/content
+    let sgPayload;
+    if (TEMPLATE_ID) {
+      sgPayload = {
+        from: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
+        reply_to: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
+        personalizations: [{
+          to: [{ email }],
+          // bcc: [{ email: FROM_EMAIL }], // включи при необходимости
+          dynamic_template_data: {
+            name: name || 'клиент',
+            year: new Date().getFullYear(),
+          },
+        }],
+        template_id: TEMPLATE_ID,
+      };
+    } else {
+      // аварийный режим (если шаблон внезапно недоступен)
+      sgPayload = {
+        from: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
+        reply_to: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
+        personalizations: [{ to: [{ email }] }],
+        subject: 'RASKAT RENTAL — регистрация получена',
+        content: [{
+          type: 'text/plain',
+          value: `Здравствуйте, ${name || 'клиент'}!\nМы получили вашу регистрацию. Менеджер свяжется с вами в ближайшее время.`,
+        }],
+      };
+    }
 
     const sgRes = await fetch(SG_URL, {
       method: 'POST',
