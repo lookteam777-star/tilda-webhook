@@ -13,8 +13,8 @@ const {
   WEBHOOK_TOKEN = 'u6eZrVh0rN1m2uU7yN3qQ0vT8pJ4aW9k',    // авторизация по ?token= или X-Webhook-Token
   SENDGRID_API_KEY,
   SEND_FROM_EMAIL_RU = 'manager@raskat.rent',
-  SENDGRID_TEMPLATE_ID_RU,
-  SENDGRID_TEMPLATE_ID_REG_RU,
+  SENDGRID_TEMPLATE_ID_RU = 'd-cb881e00e3f04d1faa169fe4656fc844',
+  SENDGRID_TEMPLATE_ID_REG_RU = 'd-cb881e00e3f04d1faa169fe4656fc844',
 } = process.env;
 
 if (sgMail && SENDGRID_API_KEY) {
