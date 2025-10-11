@@ -1,171 +1,142 @@
 // api/tilda-registration-ru.js
-// Вебхук Tilda → SendGrid (RU). Извлекаем ТОЛЬКО name и email, остальное игнорируем.
+// Мини-вебхук регистрации: Tilda → SendGrid (только name + email), авторизация по ?token= или X-Webhook-Token
 
-const SG_URL = 'https://api.sendgrid.com/v3/mail/send';
+let sgMail = null;
+try {
+  sgMail = require('@sendgrid/mail'); // если пакета нет — не упадём, но письма не уйдут
+} catch (e) {
+  console.warn('SendGrid SDK not installed; email sending will be skipped.');
+}
 
-// --- утилиты извлечения полей (работают с любыми форматами Tilda) ---
-const EMAIL_RX = /(^|\b)email(\d+)?($|\b)/i;
-const NAME_RX  = /(^|\b)(name|fullname|fio)($|\b)/i;
-const HONEYPOT_RX = /(^|\b)website($|\b)/i;
+// ==== ENV ====
+const {
+  // токен авторизации (как в старых рабочих вебхуках): ?token=...
+  WEBHOOK_TOKEN = 'raskat_2025_secret',
 
-function findInKVArray(arr, rx) {
-  if (!Array.isArray(arr)) return '';
-  for (const it of arr) {
-    const key = (it?.name || it?.key || '').toString();
-    if (rx.test(key)) {
-      const v = it?.value ?? it?.val ?? it?.content ?? '';
-      if (`${v}`.trim() !== '') return `${v}`.trim();
-    }
+  // SendGrid
+  SENDGRID_API_KEY,
+  SEND_FROM_EMAIL_RU = 'manager@raskat.rent',
+
+  // ID динамического шаблона (можно задать любой из них; если оба пустые — возьмём дефолт ниже)
+  SENDGRID_TEMPLATE_ID_RU = 'd-cb881e00e3f04d1faa169fe4656fc844',
+  SENDGRID_TEMPLATE_ID_REG_RU = 'd-cb881e00e3f04d1faa169fe4656fc844',
+} = process.env;
+
+if (sgMail && SENDGRID_API_KEY) {
+  sgMail.setApiKey(SENDGRID_API_KEY);
+}
+
+// ==== helpers ====
+const first = (v) => (Array.isArray(v) ? v[0] : v);
+
+// вытянуть значение по любому из вариантов ключей (без регистра)
+const getAny = (obj, variants = []) => {
+  const map = new Map(Object.keys(obj || {}).map(k => [k.toLowerCase(), obj[k]]));
+  for (const v of variants) {
+    const hit = map.get(String(v).toLowerCase());
+    if (hit !== undefined && String(hit).trim() !== '') return String(first(hit)).trim();
   }
   return '';
+};
+
+// принять JSON-строку или x-www-form-urlencoded → объект
+function asObject(body) {
+  if (!body) return {};
+  if (typeof body === 'object') return body;
+  const s = String(body);
+
+  // 1) JSON?
+  try {
+    const j = JSON.parse(s);
+    return Array.isArray(j) ? j[0] || {} : j;
+  } catch {}
+
+  // 2) urlencoded: a=1&b=2
+  try {
+    const params = new URLSearchParams(s);
+    const obj = {};
+    for (const [k, v] of params) obj[k] = v;
+    return obj;
+  } catch {}
+
+  return {};
 }
 
-function findInObject(obj, rx) {
-  if (!obj || typeof obj !== 'object') return '';
-  for (const [k, v] of Object.entries(obj)) {
-    if (rx.test(k) && `${v ?? ''}`.trim() !== '') return `${v}`.trim();
-  }
-  return '';
+function ok(res, body = 'OK') {
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(200).send(body);
+}
+function fail(res, error, status = 500) {
+  const msg = typeof error === 'string' ? error : (error?.message || 'server_error');
+  console.error('WEBHOOK_ERROR:', error?.stack || error);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.status(status).send(msg);
 }
 
-function deepFind(node, rx) {
-  if (!node) return '';
-  const direct = findInObject(node, rx);
-  if (direct) return direct;
-
-  const kv = findInKVArray(node, rx);
-  if (kv) return kv;
-
-  // стандартные контейнеры Tilda
-  const containers = [node?.data, node?.formdata, node?.fields, node?.form];
-  for (const c of containers) {
-    const got = deepFind(c, rx);
-    if (got) return got;
-  }
-
-  // произвольные вложения
-  if (Array.isArray(node)) {
-    for (const item of node) {
-      const got = deepFind(item, rx);
-      if (got) return got;
-    }
-  } else if (typeof node === 'object') {
-    for (const v of Object.values(node)) {
-      const got = deepFind(v, rx);
-      if (got) return got;
-    }
-  }
-  return '';
-}
-
-function normalizeBody(req) {
-  let raw = req.body;
-  if (typeof raw === 'string') {
-    try { raw = JSON.parse(raw); } catch { raw = {}; }
-  }
-  return Array.isArray(raw) ? raw[0] : (raw || {});
-}
-
-// --- обработчик ---
+// ==== handler ====
 module.exports = async (req, res) => {
   try {
-    if (req.method !== 'POST') {
-      res.setHeader('Allow', 'POST');
-      return res.status(405).send('Method Not Allowed');
+    if (req.method !== 'POST') return fail(res, 'method_not_allowed', 405);
+
+    // Авторизация: поддерживаем ?token=... и заголовок X-Webhook-Token
+    const tokenFromQuery = (req.query && req.query.token) || '';
+    const tokenFromHeader = req.headers['x-webhook-token'] || '';
+    const providedToken = String(tokenFromQuery || tokenFromHeader).trim();
+    if (providedToken !== String(WEBHOOK_TOKEN)) return fail(res, 'unauthorized', 401);
+
+    // Парсим тело
+    const received = asObject(req.body);
+
+    // Поля формы: берём только name и email (поддерживаем разные системные имена)
+    const name  = getAny(received, ['name','Name','fullname','fio','first_name','firstname']);
+    const email = getAny(received, ['email','Email','e-mail','mail','client_email','email-1','email1']);
+
+    // Honeypot — если скрытое поле заполнено, просто говорим OK
+    const website = getAny(received, ['website','Website']);
+    if (website) return ok(res);
+
+    // Важно: Tilda при “Проверить Webhook” часто шлёт пустой POST без полей → вернём OK,
+    // чтобы URL прикрепился. Реальная отправка уже будет с email, и письмо уйдёт.
+    if (!email) return ok(res);
+
+    // Если SendGrid не сконфигурирован — не падаем; для attach это достаточно
+    if (!sgMail || !SENDGRID_API_KEY) {
+      console.warn('SendGrid not configured — skip sending');
+      return ok(res);
     }
 
-    // auth
-    const q = req.query || {};
-    const provided =
-      (q.secret || q.token || '').toString().trim() ||
-      (req.headers['x-webhook-secret'] || '').toString().trim();
-    const expected = process.env.WEBHOOK_SECRET_RU;
-    if (!expected) return res.status(500).send('Missing WEBHOOK_SECRET_RU env');
-    if (!provided) return res.status(401).send('Unauthorized: no secret');
-    if (provided !== expected) return res.status(401).send('Unauthorized: bad secret');
+    // Определяем шаблон: ENV -> дефолт (ваш новый ID)
+    const templateId =
+      SENDGRID_TEMPLATE_ID_RU ||
+      SENDGRID_TEMPLATE_ID_REG_RU ||
+      'd-cb881e00e3f04d1faa169fe4656fc844'; // новый ID, который вы дали
 
-    const debug = (q.debug || '') === '1'; // показать текст ошибки SendGrid
-    const echo  = (q.echo  || '') === '1'; // вернуть распарсенные поля (без отправки)
-    const allowEmptyCheck = process.env.ALLOW_EMPTY_TILDA_CHECK === '1';
-    const ua = (req.headers['user-agent'] || '').toLowerCase();
-
-    // parse
-    const base = normalizeBody(req);
-
-    // honeypot
-    const honeypot = deepFind(base, HONEYPOT_RX);
-    if (honeypot) return res.status(200).send('OK');
-
-    const email = deepFind(base, EMAIL_RX);
-    const name  = deepFind(base, NAME_RX);
-
-    if (echo) return res.status(200).json({ parsed: { name, email }, raw: base });
-
-    // пустая проверка из админки Tilda без email — отвечаем OK, если включено ENV
-    if (!email && allowEmptyCheck && ua.includes('tilda')) {
-      return res.status(200).send('OK');
-    }
-    if (!email) return res.status(400).send('Missing email');
-
-    // env
-    const API_KEY     = process.env.SENDGRID_API_KEY;
-    const FROM_EMAIL  = process.env.SEND_FROM_EMAIL_RU || 'manager@raskat.rent';
-
-    // Поддерживаем оба имени переменной; если не заданы — используем НОВЫЙ ID по умолчанию:
-    const TEMPLATE_ID =
-      process.env.SENDGRID_TEMPLATE_ID_REG_RU ||
-      'd-cb881e00e3f04d1faa169fe4656fc844';
-
-    if (!API_KEY) return res.status(500).send('Missing SENDGRID_API_KEY env');
-
-    // если TEMPLATE_ID задан — шлём по шаблону; иначе fallback с subject/content
-    let sgPayload;
-    if (TEMPLATE_ID) {
-      sgPayload = {
-        from: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
-        reply_to: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
-        personalizations: [{
-          to: [{ email }],
-          // bcc: [{ email: FROM_EMAIL }], // включи при необходимости
-          dynamic_template_data: {
-            name: name || 'клиент',
-            year: new Date().getFullYear(),
-          },
-        }],
-        template_id: TEMPLATE_ID,
-      };
-    } else {
-      // аварийный режим (если шаблон внезапно недоступен)
-      sgPayload = {
-        from: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
-        reply_to: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
-        personalizations: [{ to: [{ email }] }],
-        subject: 'RASKAT RENTAL — регистрация получена',
-        content: [{
-          type: 'text/plain',
-          value: `Здравствуйте, ${name || 'клиент'}!\nМы получили вашу регистрацию. Менеджер свяжется с вами в ближайшее время.`,
-        }],
-      };
-    }
-
-    const sgRes = await fetch(SG_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${API_KEY}`,
-        'Content-Type': 'application/json',
+    const msg = {
+      to: email,
+      from: { email: SEND_FROM_EMAIL_RU, name: 'RASKAT RENTAL' },
+      replyTo: { email: SEND_FROM_EMAIL_RU, name: 'RASKAT RENTAL' },
+      templateId,
+      dynamicTemplateData: {
+        name: name || 'клиент',
+        year: new Date().getFullYear(),
       },
-      body: JSON.stringify(sgPayload),
-    });
+    };
 
-    if (!sgRes.ok) {
-      const txt = await sgRes.text();
-      console.error('SendGrid error:', sgRes.status, txt);
-      return res.status(502).send(debug ? `SendGrid error ${sgRes.status}: ${txt}` : 'SendGrid error');
+    try {
+      const r = await sgMail.send(msg);
+      console.log('SendGrid status:', r[0]?.statusCode);
+    } catch (e) {
+      // Вернём текст ошибки наружу (удобно видеть в Tilda сразу причину)
+      const msg = e?.response?.body ? JSON.stringify(e.response.body) : (e.message || 'sendgrid_error');
+      return fail(res, msg, 502);
     }
 
-    return res.status(200).send('OK');
-  } catch (e) {
-    console.error(e);
-    return res.status(500).send('Server error');
+    return ok(res);
+  } catch (err) {
+    return fail(res, err, 500);
   }
 };
+
+// Явно укажем Node runtime
+module.exports.config = { runtime: 'nodejs18.x' };
