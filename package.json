@@ -1,5 +1,9 @@
 {
   "name": "tilda-webhook",
   "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@sendgrid/mail": "^8.1.0"
+  },
   "engines": { "node": "20.x" }
 }
