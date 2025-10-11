@@ -1,52 +1,76 @@
-// Мини-вебхук: Tilda → SendGrid (берём только name и email)
+// Вебхук Tilda → SendGrid (RU). Извлекаем ТОЛЬКО name и email максимально надёжно.
 
 const SG_URL = 'https://api.sendgrid.com/v3/mail/send';
 
-// чтение значения по возможным ключам
-const pick = (obj, ...keys) => {
-  for (const k of keys) {
-    const v = obj?.[k];
-    if (v !== undefined && v !== null && `${v}`.trim() !== '') return `${v}`.trim();
-  }
-  return '';
-};
+// --- утилиты поиска значения по «похожим» ключам ---
+const EMAIL_RX = /(^|\b)email(\d+)?($|\b)/i;
+const NAME_RX  = /(^|\b)(name|fullname|fio)($|\b)/i;
+const HONEYPOT_RX = /(^|\b)website($|\b)/i;
 
-// поиск в массивах вида [{name, value}]
-const kvLookup = (arr, ...names) => {
+// ищем в массиве вида [{name,value}] или [{key,val}] с "похожими" именами
+function findInKVArray(arr, rx) {
   if (!Array.isArray(arr)) return '';
-  const lower = names.map((n) => n.toLowerCase());
   for (const it of arr) {
-    const n = (it?.name || it?.key || '').toString().toLowerCase();
-    if (lower.includes(n)) {
+    const key = (it?.name || it?.key || '').toString();
+    if (rx.test(key)) {
       const v = it?.value ?? it?.val ?? it?.content ?? '';
       if (`${v}`.trim() !== '') return `${v}`.trim();
     }
   }
   return '';
-};
+}
 
-// извлекаем name/email из разных форматов Tilda
-function extractNameEmail(req) {
+// ищем по объекту: перебираем ВСЕ ключи и берём первый, чьё имя подходит по regex
+function findInObject(obj, rx) {
+  if (!obj || typeof obj !== 'object') return '';
+  for (const [k, v] of Object.entries(obj)) {
+    if (rx.test(k) && `${v ?? ''}`.trim() !== '') return `${v}`.trim();
+  }
+  return '';
+}
+
+// глубокий поиск: обходим произвольную структуру (объекты/массивы) и пытаемся вытащить по regex
+function deepFind(node, rx) {
+  if (!node) return '';
+  // прямое совпадение в объекте
+  const direct = findInObject(node, rx);
+  if (direct) return direct;
+
+  // массив пар?
+  const kv = findInKVArray(node, rx);
+  if (kv) return kv;
+
+  // известные контейнеры tilda
+  const containers = [node?.data, node?.formdata, node?.fields, node?.form];
+  for (const c of containers) {
+    const fromContainer = deepFind(c, rx);
+    if (fromContainer) return fromContainer;
+  }
+
+  // обычные вложенные структуры
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const got = deepFind(item, rx);
+      if (got) return got;
+    }
+  } else if (typeof node === 'object') {
+    for (const v of Object.values(node)) {
+      const got = deepFind(v, rx);
+      if (got) return got;
+    }
+  }
+  return '';
+}
+
+// нормализуем body из Tilda (string | array | object)
+function normalizeBody(req) {
   let raw = req.body;
   if (typeof raw === 'string') {
     try { raw = JSON.parse(raw); } catch { raw = {}; }
   }
+  // Tilda часто шлёт массив с одним объектом
   const base = Array.isArray(raw) ? raw[0] : (raw || {});
-  const dataArr = base?.data || base?.formdata || base?.fields || base?.form;
-
-  const email =
-    kvLookup(dataArr, 'email', 'Email') ||
-    pick(base, 'email', 'Email', 'e-mail', 'mail');
-
-  const name =
-    kvLookup(dataArr, 'name', 'fullname', 'fio', 'Name') ||
-    pick(base, 'name', 'fullname', 'fio', 'Name');
-
-  const website =
-    kvLookup(dataArr, 'website') ||
-    pick(base, 'website'); // honeypot
-
-  return { name, email, website, raw: base };
+  return base;
 }
 
 module.exports = async (req, res) => {
@@ -56,7 +80,7 @@ module.exports = async (req, res) => {
       return res.status(405).send('Method Not Allowed');
     }
 
-    // auth по секрету (query ?secret=... или заголовок X-Webhook-Secret)
+    // auth по секрету
     const q = req.query || {};
     const provided =
       (q.secret || q.token || '').toString().trim() ||
@@ -66,32 +90,41 @@ module.exports = async (req, res) => {
     if (!provided) return res.status(401).send('Unauthorized: no secret');
     if (provided !== expected) return res.status(401).send('Unauthorized: bad secret');
 
-    const debug = (q.debug || '') === '1'; // возвращать текст ошибки SG
-    const isCheck = (q.check || '') === '1'; // пропустить пустую проверку в UI Tilda
-    const echo = (q.echo || '') === '1'; // вернуть распарсенное, без отправки
+    const debug = (q.debug || '') === '1';
+    const isCheck = (q.check || '') === '1';
+    const echo = (q.echo || '') === '1';
 
-    // парсинг
-    const { name, email, website, raw } = extractNameEmail(req);
+    const base = normalizeBody(req);
 
-    if (website) return res.status(200).send('OK'); // honeypot
-    if (echo) return res.status(200).json({ parsed: { name, email }, raw });
+    // honeypot (если вдруг Tilda/браузер что-то подставил — письмо не шлём)
+    const honeypot =
+      deepFind(base, HONEYPOT_RX);
+    if (honeypot) return res.status(200).send('OK');
 
-    if (!email && isCheck) return res.status(200).send('OK'); // проверка в Tilda
+    // достаём email / name из любых мест
+    const email = deepFind(base, EMAIL_RX);
+    const name  = deepFind(base, NAME_RX);
+
+    if (echo) {
+      return res.status(200).json({ parsed: { name, email }, raw: base });
+    }
+
+    if (!email && isCheck) return res.status(200).send('OK');
     if (!email) return res.status(400).send('Missing email');
 
     // env
-    const API_KEY = process.env.SENDGRID_API_KEY;
+    const API_KEY    = process.env.SENDGRID_API_KEY;
     const FROM_EMAIL = process.env.SEND_FROM_EMAIL_RU || 'manager@raskat.rent';
-    const TEMPLATE_ID = process.env.SENDGRID_TEMPLATE_ID_RU || 'd-cb881e00e3f04d1faa169fe4656fc844';
+    const TEMPLATE_ID = process.env.SENDGRID_TEMPLATE_ID_RU || 'd-cb881e00e3f04d1faa169fe4656fc84';
     if (!API_KEY) return res.status(500).send('Missing SENDGRID_API_KEY env');
 
-    // только name/email в dynamic_template_data
+    // отправляем только name/email
     const sgPayload = {
       from: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
       reply_to: { email: FROM_EMAIL, name: 'RASKAT RENTAL' },
       personalizations: [{
         to: [{ email }],
-        // bcc: [{ email: FROM_EMAIL }], // включи, если нужна копия менеджеру
+        // bcc: [{ email: FROM_EMAIL }], // включи при необходимости
         dynamic_template_data: {
           name: name || 'клиент',
           year: new Date().getFullYear(),
