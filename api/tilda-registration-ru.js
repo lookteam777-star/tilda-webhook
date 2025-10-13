@@ -1,22 +1,23 @@
 // api/tilda-registration-ru.js
 // Tilda → SendGrid (только name + email), многоязычно (RU/EN/SR) по токенам.
 // Авторизация: token из BODY (POST), Header (X-Webhook-Token) или Query (?token=).
+// Есть форс языка: hidden поле lang/language/locale или ?force=ru|en|sr
 
 let sgMail = null;
 try { sgMail = require('@sendgrid/mail'); }
 catch { console.warn('SendGrid SDK not installed; emails will be skipped.'); }
 
 /* ===================== ENV + Aliases ===================== */
-// SendGrid API key
+// SendGrid
 const SG_API_KEY =
   process.env.SENDGRID_API_KEY ||
-  process.env.SG_API_KEY; // на всякий случай
+  process.env.SG_API_KEY;
 
-// From
 const FROM_EMAIL =
   process.env.SEND_FROM_EMAIL_RU ||
   process.env.FROM_EMAIL ||
   'manager@raskat.rent';
+
 const FROM_NAME =
   process.env.FROM_NAME ||
   'RASKAT RENTAL';
@@ -25,7 +26,7 @@ const FROM_NAME =
 const TOK_RU =
   process.env.WEBHOOK_TOKEN_RU  ||
   process.env.WEBHOOK_SECRET_RU ||
-  process.env.WEBHOOK_TOKEN; // общий старый — как RU
+  process.env.WEBHOOK_TOKEN; // общий старый — считаем RU
 
 const TOK_EN =
   process.env.WEBHOOK_TOKEN_EN  ||
@@ -37,25 +38,24 @@ const TOK_SR =
 
 // ID динамических шаблонов (поддерживаем *_REG_*)
 const TPL_RU =
-  process.env.SENDGRID_TEMPLATE_ID_RU      ||
-  process.env.SENDGRID_TEMPLATE_ID_REG_RU  ||
+  process.env.SENDGRID_TEMPLATE_ID_RU     ||
+  process.env.SENDGRID_TEMPLATE_ID_REG_RU ||
   'd-cb881e00e3f04d1faa169fe4656fc844';
 
 const TPL_EN =
-  process.env.SENDGRID_TEMPLATE_ID_EN      ||
-  process.env.SENDGRID_TEMPLATE_ID_REG_EN  ||
+  process.env.SENDGRID_TEMPLATE_ID_EN     ||
+  process.env.SENDGRID_TEMPLATE_ID_REG_EN ||
   TPL_RU;
 
 const TPL_SR =
-  process.env.SENDGRID_TEMPLATE_ID_SR      ||
-  process.env.SENDGRID_TEMPLATE_ID_REG_SR  ||
+  process.env.SENDGRID_TEMPLATE_ID_SR     ||
+  process.env.SENDGRID_TEMPLATE_ID_REG_SR ||
   TPL_RU;
 
 if (sgMail && SG_API_KEY) sgMail.setApiKey(SG_API_KEY);
 
 /* ===================== helpers ===================== */
 const first = (v) => (Array.isArray(v) ? v[0] : v);
-
 const getAny = (obj, variants = []) => {
   const map = new Map(Object.keys(obj || {}).map(k => [k.toLowerCase(), obj[k]]));
   for (const key of variants) {
@@ -106,50 +106,64 @@ module.exports = async (req, res) => {
   try {
     if (req.method !== 'POST') return fail(res, 'method_not_allowed', 405);
 
-    // Парсим тело (токен может быть в POST)
+    // 1) парсим тело (токен может быть в POST)
     const received = asObject(req.body);
 
-    // Токен из body/header/query
+    // 2) токен из body/header/query
     const tokenBody   = getAny(received, ['x-webhook-token','X-Webhook-Token','webhook_token','token','api_key']);
     const tokenHeader = req.headers['x-webhook-token'] || '';
     const tokenQuery  = (req.query && req.query.token) || '';
     const providedToken = String(tokenBody || tokenHeader || tokenQuery).trim();
 
-    // Определение локали по токену
+    // 3) язык по токену
     let locale = null;
     if (providedToken && providedToken === TOK_RU) locale = 'ru';
     if (providedToken && providedToken === TOK_EN) locale = 'en';
     if (providedToken && providedToken === TOK_SR) locale = 'sr';
 
-    if (!locale) return fail(res, 'unauthorized', 401);
+    // 4) форс языка из формы/квери (высший приоритет)
+    const bodyLang   = (getAny(received, ['lang','language','locale']) || '').toLowerCase();
+    const queryForce = (req.query?.force || '').toLowerCase();
+    const toIso = (v) => (v === 'rs' ? 'sr' : v);
+    const forced = toIso(bodyLang || queryForce);
+    if (['ru','en','sr'].includes(forced)) {
+      locale = forced; // перекрываем определение по токену
+    }
 
-    // Поля формы
-    const name  = getAny(received, ['name','Name','fullname','fio','first_name','firstname']);
-    const email = getAny(received, ['email','Email','e-mail','mail','client_email','email-1','email1']);
-    const website = getAny(received, ['website','Website']); // honeypot
-
-    const mask = (s) => (s ? s.replace(/(.).+(@.*)/, '$1***$2') : '');
-    console.log('[registration]', {
-      locale, hasEmail: !!email, email: mask(email),
-      keys: Object.keys(received || {})
+    // диагностика
+    const safeLen = (s) => (s ? String(s).length : 0);
+    console.log('[locale-detect]', {
+      providedTokenLen: safeLen(providedToken),
+      eqRU: providedToken === TOK_RU,
+      eqEN: providedToken === TOK_EN,
+      eqSR: providedToken === TOK_SR,
+      bodyLang,
+      queryForce,
+      finalLocale: locale
     });
 
-    // Отладочный echo-режим: ?echo=1
+    if (!locale) return fail(res, 'unauthorized', 401);
+
+    // 5) поля формы
+    const name   = getAny(received, ['name','Name','fullname','fio','first_name','firstname']);
+    const email  = getAny(received, ['email','Email','e-mail','mail','client_email','email-1','email1']);
+    const website= getAny(received, ['website','Website']); // honeypot
+
+    const mask = (s)=> (s ? s.replace(/(.).+(@.*)/,'$1***$2') : '');
+    console.log('[registration]', { locale, hasEmail: !!email, email: mask(email), keys: Object.keys(received||{}) });
+
+    // echo-режим: ?echo=1 вернёт распарсенные поля
     if (String(req.query?.echo || '') === '1') {
       return res.status(200).json({ locale, parsed: { name, email }, raw: received });
     }
 
-    // Бот / пустые проверки из Tilda → OK
+    // пустые проверки/боты → OK
     if (website) return ok(res);
     if (!email)  return ok(res);
 
-    // Если SendGrid не настроен — не падаем
-    if (!sgMail || !SG_API_KEY) {
-      console.warn('SendGrid not configured — skip sending');
-      return ok(res);
-    }
+    // 6) sendgrid
+    if (!sgMail || !SG_API_KEY) { console.warn('SendGrid not configured — skip sending'); return ok(res); }
 
-    // Шаблон и дефолтное имя по языку
     const templateId = locale === 'en' ? TPL_EN : (locale === 'sr' ? TPL_SR : TPL_RU);
     const defaultName = locale === 'en' ? 'customer' : (locale === 'sr' ? 'klijent' : 'клиент');
 
